@@ -1,0 +1,1911 @@
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    ChatJoinRequest,
+    ChatMemberUpdated,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# НАСТРОЙКИ
+# Токен берём из переменной окружения: export BOT_TOKEN="..."
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# Владельцы: видят управление админами, их нельзя удалить из панели
+OWNER_IDS = {8345646899}
+DB_PATH = "bot.db"
+# Часовой пояс для отложенных рассылок
+TIMEZONE = "Europe/Moscow"
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+DEFAULT_SUCCESS = "🎉 Спасибо за подписку! Доступ открыт."
+DEFAULT_WELCOME = (
+    "👋 Добро пожаловать! Выбери один из трёх подарков 🎁"
+)
+DEFAULT_WIN = (
+    "🎉 Поздравляем, тебе выпало 15.000 R$!\n\n"
+    "🎮 Напиши свой ник в Roblox одним сообщением."
+)
+DEFAULT_SUBSCRIBE = (
+    "🎁 Чтобы забрать награду, подпишитесь на каналы "
+    "ниже и нажмите «Проверить подписку»."
+)
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+BUTTON_RE = re.compile(
+    r"^(.{1,64}?)\s*\|\s*((?:https?|tg)://\S+)$"
+)
+
+router = Router()
+broadcast_lock = asyncio.Lock()
+
+
+# БАЗА ДАННЫХ
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                joined_at TEXT,
+                active INTEGER DEFAULT 1,
+                source TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_at TEXT NOT NULL,
+                admin_id INTEGER,
+                from_chat_id INTEGER,
+                message_id INTEGER,
+                btn_text TEXT,
+                btn_url TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+
+        # миграция старой таблицы users
+        cols = [
+            r["name"]
+            for r in c.execute("PRAGMA table_info(users)")
+        ]
+        if "joined_at" not in cols:
+            c.execute(
+                "ALTER TABLE users ADD COLUMN joined_at TEXT"
+            )
+        if "active" not in cols:
+            c.execute(
+                "ALTER TABLE users "
+                "ADD COLUMN active INTEGER DEFAULT 1"
+            )
+        if "source" not in cols:
+            c.execute(
+                "ALTER TABLE users ADD COLUMN source TEXT"
+            )
+        for col in ("roblox_nick", "nick_at", "tg_username"):
+            if col not in cols:
+                c.execute(
+                    f"ALTER TABLE users ADD COLUMN {col} TEXT"
+                )
+
+
+def list_channels():
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM channels ORDER BY title"
+        ).fetchall()
+
+
+def add_channel(chat_id, title, link):
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO channels VALUES (?, ?, ?)",
+            (chat_id, title, link)
+        )
+
+
+def remove_channel(chat_id):
+    with db() as c:
+        c.execute(
+            "DELETE FROM channels WHERE chat_id = ?",
+            (chat_id,)
+        )
+
+
+def get_setting(key, default=""):
+    with db() as c:
+        row = c.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO settings VALUES (?, ?)",
+            (key, value)
+        )
+
+
+# ПОЛЬЗОВАТЕЛИ И СТАТИСТИКА
+def save_user(user_id, source=None):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users "
+            "(user_id, joined_at, active, source) "
+            "VALUES (?, datetime('now'), 1, ?)",
+            (user_id, source)
+        )
+        c.execute(
+            "UPDATE users SET active = 1 WHERE user_id = ?",
+            (user_id,)
+        )
+
+
+def set_user_active(user_id, active):
+    with db() as c:
+        c.execute(
+            "UPDATE users SET active = ? WHERE user_id = ?",
+            (1 if active else 0, user_id)
+        )
+
+
+def active_user_ids():
+    with db() as c:
+        rows = c.execute(
+            "SELECT user_id FROM users WHERE active = 1"
+        ).fetchall()
+    return [r["user_id"] for r in rows]
+
+
+def source_count(name):
+    with db() as c:
+        return c.execute(
+            "SELECT COUNT(*) FROM users WHERE source = ?",
+            (name,)
+        ).fetchone()[0]
+
+
+def save_nick(user_id, nick, username):
+    with db() as c:
+        c.execute(
+            "UPDATE users SET roblox_nick = ?, "
+            "nick_at = datetime('now'), tg_username = ? "
+            "WHERE user_id = ?",
+            (nick, username, user_id)
+        )
+
+
+def nicks_text():
+    with db() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM users "
+            "WHERE roblox_nick IS NOT NULL"
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT user_id, roblox_nick, tg_username FROM users "
+            "WHERE roblox_nick IS NOT NULL "
+            "ORDER BY nick_at DESC LIMIT 30"
+        ).fetchall()
+
+    lines = [
+        f"• {r['roblox_nick']} — "
+        f"{'@' + r['tg_username'] if r['tg_username'] else 'без username'}"
+        f" (id {r['user_id']})"
+        for r in rows
+    ] or ["Пока никто не ввёл ник."]
+
+    return (
+        f"🎮 Ники Roblox (последние 30 из {total})\n\n"
+        + "\n".join(lines)
+    )
+
+
+def stats_text():
+    with db() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+        active = c.execute(
+            "SELECT COUNT(*) FROM users WHERE active = 1"
+        ).fetchone()[0]
+
+        def new_since(days):
+            return c.execute(
+                "SELECT COUNT(*) FROM users "
+                "WHERE date(joined_at) >= date('now', ?)",
+                (f"-{days} days",)
+            ).fetchone()[0]
+
+        today = new_since(0)
+        week = new_since(6)
+        month = new_since(29)
+
+        by_day = c.execute(
+            "SELECT date(joined_at) AS d, COUNT(*) AS n "
+            "FROM users "
+            "WHERE date(joined_at) >= date('now', '-6 days') "
+            "GROUP BY d ORDER BY d DESC"
+        ).fetchall()
+
+        sources = c.execute(
+            "SELECT source, COUNT(*) AS n FROM users "
+            "WHERE source IS NOT NULL "
+            "GROUP BY source ORDER BY n DESC LIMIT 10"
+        ).fetchall()
+
+    days = "\n".join(
+        f"• {r['d']} — {r['n']}" for r in by_day
+    ) or "—"
+
+    src = "\n".join(
+        f"• {r['source']} — {r['n']}" for r in sources
+    ) or "—"
+
+    return (
+        "📊 Статистика (время UTC)\n\n"
+        f"👥 Всего: {total}\n"
+        f"✅ Активных: {active}\n"
+        f"🚫 Заблокировали бота: {total - active}\n\n"
+        f"🆕 Новых сегодня: {today}\n"
+        f"🗓 За 7 дней: {week}\n"
+        f"🗓 За 30 дней: {month}\n"
+        f"📢 Каналов: {len(list_channels())}\n\n"
+        f"Новые по дням:\n{days}\n\n"
+        f"Источники (топ-10):\n{src}"
+    )
+
+
+# АДМИНЫ
+def is_owner(user_id):
+    return user_id in OWNER_IDS
+
+
+def db_admin_ids():
+    with db() as c:
+        rows = c.execute(
+            "SELECT user_id FROM admins ORDER BY user_id"
+        ).fetchall()
+    return [r["user_id"] for r in rows]
+
+
+def is_admin(user_id):
+    return is_owner(user_id) or user_id in db_admin_ids()
+
+
+def add_admin(user_id):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO admins VALUES (?)",
+            (user_id,)
+        )
+
+
+def remove_admin(user_id):
+    with db() as c:
+        c.execute(
+            "DELETE FROM admins WHERE user_id = ?",
+            (user_id,)
+        )
+
+
+# ОТЛОЖЕННЫЕ РАССЫЛКИ
+def parse_local_time(text):
+    """'ДД.ММ.ГГГГ ЧЧ:ММ' в TIMEZONE -> aware datetime в UTC."""
+    dt = datetime.strptime(text.strip(), "%d.%m.%Y %H:%M")
+    dt = dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    return dt.astimezone(timezone.utc)
+
+
+def utc_str_to_local(value):
+    dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo(TIMEZONE)).strftime(
+        "%d.%m.%Y %H:%M"
+    )
+
+
+def add_scheduled(
+    run_at_utc, admin_id, from_chat_id,
+    message_id, btn_text, btn_url
+):
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO scheduled "
+            "(run_at, admin_id, from_chat_id, message_id, "
+            "btn_text, btn_url) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                admin_id, from_chat_id, message_id,
+                btn_text, btn_url,
+            )
+        )
+        return cur.lastrowid
+
+
+def list_scheduled():
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM scheduled WHERE status = 'pending' "
+            "ORDER BY run_at"
+        ).fetchall()
+
+
+def cancel_scheduled(sched_id):
+    with db() as c:
+        c.execute(
+            "UPDATE scheduled SET status = 'cancelled' "
+            "WHERE id = ? AND status = 'pending'",
+            (sched_id,)
+        )
+
+
+def claim_due():
+    """Забирает наступившие рассылки (помечает как running)."""
+    claimed = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM scheduled WHERE status = 'pending' "
+            "AND run_at <= datetime('now') ORDER BY run_at"
+        ).fetchall()
+        for row in rows:
+            cur = c.execute(
+                "UPDATE scheduled SET status = 'running' "
+                "WHERE id = ? AND status = 'pending'",
+                (row["id"],)
+            )
+            if cur.rowcount:
+                claimed.append(row)
+    return claimed
+
+
+def finish_scheduled(sched_id):
+    with db() as c:
+        c.execute(
+            "UPDATE scheduled SET status = 'done' WHERE id = ?",
+            (sched_id,)
+        )
+
+
+# АНТИСПАМ
+_last_action = {}
+
+
+def throttled(user_id, key, seconds=3.0):
+    now = time.monotonic()
+    k = (user_id, key)
+
+    if now - _last_action.get(k, 0) < seconds:
+        return True
+
+    _last_action[k] = now
+
+    if len(_last_action) > 20000:
+        for old in [
+            kk for kk, t in _last_action.items()
+            if now - t > 60
+        ]:
+            _last_action.pop(old, None)
+
+    return False
+
+
+# ПРОВЕРКА ПОДПИСКИ
+async def get_unsubscribed(bot, user_id, exclude=None):
+    missing = []
+
+    for ch in list_channels():
+        if exclude is not None and ch["chat_id"] == exclude:
+            continue
+
+        try:
+            member = await bot.get_chat_member(
+                ch["chat_id"], user_id
+            )
+
+            subscribed = (
+                member.status in (
+                    "member", "administrator", "creator"
+                )
+                or (
+                    member.status == "restricted"
+                    and getattr(member, "is_member", False)
+                )
+            )
+
+            if not subscribed:
+                missing.append(ch)
+
+        except Exception:
+            logging.exception(
+                "Ошибка проверки канала %s",
+                ch["chat_id"]
+            )
+            missing.append(ch)
+
+    return missing
+
+
+def subscribe_keyboard(channels, check_data="check_sub"):
+    kb = InlineKeyboardBuilder()
+
+    for ch in channels:
+        kb.button(
+            text=f"📢 {ch['title']}",
+            url=ch["link"]
+        )
+
+    kb.button(
+        text="✅ Проверить подписку",
+        callback_data=check_data
+    )
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+async def send_access(bot, chat_id):
+    text = get_setting("success_text", DEFAULT_SUCCESS)
+    link = get_setting("target_link")
+    kb = None
+
+    if link:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🚀 Перейти", url=link)
+        kb = builder.as_markup()
+
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
+def continue_keyboard():
+    kb = InlineKeyboardBuilder()
+    for i in (1, 2, 3):
+        kb.button(text="🎁", callback_data=f"go:{i}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+
+async def send_subscribe(
+    bot, chat_id, channels, check_data="check_sub"
+):
+    """Просьба подписаться на каналы (шаг после ввода ника)."""
+    await bot.send_message(
+        chat_id,
+        get_setting("subscribe_text", DEFAULT_SUBSCRIBE),
+        reply_markup=subscribe_keyboard(
+            channels, check_data=check_data
+        )
+    )
+
+
+async def send_welcome(bot, chat_id):
+    """Приветствие с тремя кнопками-подарками (и картинкой, если задана)."""
+    text = get_setting("welcome_text", DEFAULT_WELCOME)
+    photo = get_setting("welcome_photo")
+    markup = continue_keyboard()
+
+    if photo:
+        try:
+            await bot.send_photo(
+                chat_id,
+                photo,
+                caption=text,
+                reply_markup=markup
+            )
+            return
+        except Exception:
+            logging.exception("Не удалось отправить картинку")
+
+    await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+# ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ
+@router.message(CommandStart())
+async def cmd_start(
+    message: Message,
+    bot: Bot,
+    command: CommandObject,
+    state: FSMContext
+):
+    if throttled(message.from_user.id, "start", 1.0):
+        return
+
+    await state.clear()
+
+    source = None
+    if command.args and SOURCE_RE.match(command.args):
+        source = command.args
+
+    save_user(message.from_user.id, source)
+
+    await send_welcome(bot, message.chat.id)
+
+
+@router.callback_query(F.data.startswith("go:"))
+async def cb_go(call: CallbackQuery, state: FSMContext):
+    if throttled(call.from_user.id, "go", 2.0):
+        await call.answer()
+        return
+
+    await call.answer()
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await state.set_state(UserStates.roblox_nick)
+    await call.message.answer(
+        get_setting("win_text", DEFAULT_WIN)
+    )
+
+
+@router.callback_query(F.data == "check_sub")
+async def cb_check(call: CallbackQuery, bot: Bot):
+    if throttled(call.from_user.id, "check", 3.0):
+        await call.answer("Подождите пару секунд ⏳")
+        return
+
+    missing = await get_unsubscribed(bot, call.from_user.id)
+
+    if missing:
+        names = ", ".join(ch["title"] for ch in missing)
+        await call.answer(
+            f"Вы ещё не подписаны: {names}",
+            show_alert=True
+        )
+        return
+
+    await call.answer("Подписка подтверждена ✅")
+
+    chat_id = call.message.chat.id
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await send_access(bot, chat_id)
+
+
+# ВХОД ПО ЗАЯВКЕ
+@router.chat_join_request()
+async def on_join_request(req: ChatJoinRequest, bot: Bot):
+    join_id = get_setting("join_chat_id")
+
+    if not join_id or str(req.chat.id) != join_id:
+        return
+
+    user_id = req.from_user.id
+    missing = await get_unsubscribed(
+        bot, user_id, exclude=req.chat.id
+    )
+
+    try:
+        if not missing:
+            await bot.approve_chat_join_request(
+                req.chat.id, user_id
+            )
+            await send_access(bot, req.user_chat_id)
+            return
+
+        await send_subscribe(
+            bot,
+            req.user_chat_id,
+            missing,
+            check_data=f"jr:{req.chat.id}"
+        )
+    except Exception:
+        logging.exception(
+            "Ошибка обработки заявки от %s", user_id
+        )
+
+
+@router.callback_query(F.data.startswith("jr:"))
+async def cb_join_check(call: CallbackQuery, bot: Bot):
+    if throttled(call.from_user.id, "check", 3.0):
+        await call.answer("Подождите пару секунд ⏳")
+        return
+
+    chat_id = int(call.data.split(":", 1)[1])
+
+    missing = await get_unsubscribed(
+        bot, call.from_user.id, exclude=chat_id
+    )
+
+    if missing:
+        names = ", ".join(ch["title"] for ch in missing)
+        await call.answer(
+            f"Вы ещё не подписаны: {names}",
+            show_alert=True
+        )
+        return
+
+    try:
+        await bot.approve_chat_join_request(
+            chat_id, call.from_user.id
+        )
+    except Exception:
+        logging.exception("Не удалось одобрить заявку")
+        await call.answer(
+            "Заявка не найдена или уже обработана. "
+            "Подайте её заново.",
+            show_alert=True
+        )
+        return
+
+    await call.answer("Заявка одобрена ✅")
+
+    msg_chat = call.message.chat.id
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await send_access(bot, msg_chat)
+
+
+# Пользователь заблокировал / разблокировал бота
+@router.my_chat_member(F.chat.type == "private")
+async def on_my_chat_member(event: ChatMemberUpdated):
+    status = event.new_chat_member.status
+    if status == "kicked":
+        set_user_active(event.from_user.id, False)
+    elif status == "member":
+        set_user_active(event.from_user.id, True)
+
+
+# АДМИН-ПАНЕЛЬ
+class UserStates(StatesGroup):
+    roblox_nick = State()
+
+
+class AdminStates(StatesGroup):
+    add_channel = State()
+    set_link = State()
+    set_text = State()
+    broadcast = State()
+    broadcast_button = State()
+    schedule_time = State()
+    add_admin = State()
+    join_channel = State()
+    source_name = State()
+    welcome_text = State()
+    sub_text = State()
+    win_text = State()
+    welcome_photo = State()
+
+
+def admin_menu(user_id=None):
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text="➕ Добавить канал", callback_data="adm:add")
+    kb.button(text="🗑 Удалить канал", callback_data="adm:del")
+    kb.button(text="📋 Список каналов", callback_data="adm:list")
+    kb.button(
+        text="🔗 Ссылка после подписки",
+        callback_data="adm:link"
+    )
+    kb.button(
+        text="✏️ Текст после подписки",
+        callback_data="adm:text"
+    )
+    kb.button(text="📨 Рассылка", callback_data="adm:bc")
+    kb.button(text="⏰ Отложенные", callback_data="adm:sched")
+    kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.button(text="🏷 Источники", callback_data="adm:src")
+    kb.button(
+        text="🚪 Вход по заявке",
+        callback_data="adm:join"
+    )
+    kb.button(
+        text="👋 Приветствие",
+        callback_data="adm:welcome"
+    )
+    kb.button(
+        text="🎮 Ники Roblox",
+        callback_data="adm:nicks"
+    )
+
+    layout = [2, 1, 2, 2, 2, 2, 1]
+
+    if user_id is not None and is_owner(user_id):
+        kb.button(text="👮 Админы", callback_data="adm:admins")
+        layout.append(1)
+
+    kb.adjust(*layout)
+    return kb.as_markup()
+
+
+def back_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    return kb.as_markup()
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.clear()
+    await message.answer(
+        "⚙️ Админ-панель",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+def parse_channel_ref(message):
+    """Достаёт ссылку на чат из пересылки, @username, t.me или ID."""
+    origin = getattr(message, "forward_origin", None)
+
+    if (
+        origin is not None
+        and getattr(origin, "chat", None) is not None
+    ):
+        return origin.chat.id
+
+    if message.text:
+        text = message.text.strip()
+
+        if re.fullmatch(r"-?\d+", text):
+            return int(text)
+
+        match = re.search(
+            r"(?:t\.me/|@)([A-Za-z0-9_]{4,})$",
+            text
+        )
+        if match:
+            return "@" + match.group(1)
+
+    return None
+
+
+def admins_screen():
+    kb = InlineKeyboardBuilder()
+
+    lines = ["👮 Админы\n", "Владельцы:"]
+    lines += [f"• {uid}" for uid in sorted(OWNER_IDS)]
+    lines.append("\nДобавленные:")
+
+    extra = [
+        uid for uid in db_admin_ids()
+        if uid not in OWNER_IDS
+    ]
+    lines += [f"• {uid}" for uid in extra] or ["—"]
+
+    for uid in extra:
+        kb.button(
+            text=f"❌ Убрать {uid}",
+            callback_data=f"rma:{uid}"
+        )
+
+    kb.button(
+        text="➕ Добавить админа",
+        callback_data="adm:addadmin"
+    )
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+
+    return "\n".join(lines), kb.as_markup()
+
+
+def join_screen():
+    join_id = get_setting("join_chat_id")
+    join_link = get_setting("join_link")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="⚙️ Выбрать канал" if not join_id
+        else "🔄 Сменить канал",
+        callback_data="adm:joinset"
+    )
+
+    if join_id:
+        kb.button(text="⛔ Отключить", callback_data="adm:joinoff")
+        text = (
+            "🚪 Вход по заявке: включён\n\n"
+            f"Канал: {join_id}\n"
+            f"Ссылка для заявок: {join_link}\n\n"
+            "Когда человек подаёт заявку, бот проверяет "
+            "подписку на остальные каналы и сам одобряет её. "
+            "Если подписки нет, бот пришлёт ему список каналов."
+        )
+    else:
+        text = (
+            "🚪 Вход по заявке: выключен\n\n"
+            "Выберите закрытый канал. Бот создаст ссылку с "
+            "заявкой и будет одобрять только подписавшихся."
+        )
+
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return text, kb.as_markup()
+
+
+def welcome_screen():
+    text = get_setting("welcome_text", DEFAULT_WELCOME)
+    has_photo = bool(get_setting("welcome_photo"))
+    sub_text = get_setting("subscribe_text", DEFAULT_SUBSCRIBE)
+    win_text = get_setting("win_text", DEFAULT_WIN)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="✏️ Изменить текст",
+        callback_data="adm:welcome_text"
+    )
+    kb.button(
+        text="🖼 Сменить картинку" if has_photo
+        else "🖼 Добавить картинку",
+        callback_data="adm:welcome_photo"
+    )
+    if has_photo:
+        kb.button(
+            text="🗑 Убрать картинку",
+            callback_data="adm:welcome_photo_off"
+        )
+    kb.button(
+        text="✏️ Текст выигрыша",
+        callback_data="adm:win_text"
+    )
+    kb.button(
+        text="✏️ Текст про подписку",
+        callback_data="adm:sub_text"
+    )
+    kb.button(
+        text="👁 Предпросмотр",
+        callback_data="adm:welcome_preview"
+    )
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+
+    screen = (
+        "👋 Приветствие (при /start, под ним три кнопки 🎁)\n\n"
+        f"Текст:\n{text}\n\n"
+        f"Картинка: {'есть' if has_photo else 'нет'}\n\n"
+        "🎉 Текст после выбора подарка:\n"
+        f"{win_text}\n\n"
+        "🎁 Текст про подписку (после ввода ника):\n"
+        f"{sub_text}"
+    )
+    return screen, kb.as_markup()
+
+
+def scheduled_screen():
+    rows = list_scheduled()
+    kb = InlineKeyboardBuilder()
+
+    if not rows:
+        text = "⏰ Отложенных рассылок нет."
+    else:
+        lines = [f"⏰ Отложенные рассылки ({TIMEZONE}):\n"]
+        for r in rows:
+            lines.append(
+                f"#{r['id']} — {utc_str_to_local(r['run_at'])}"
+            )
+            kb.button(
+                text=f"❌ Отменить #{r['id']}",
+                callback_data=f"sc:{r['id']}"
+            )
+        text = "\n".join(lines)
+
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
+    return text, kb.as_markup()
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def admin_callbacks(
+    call: CallbackQuery,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    action = call.data.split(":", 1)[1]
+
+    if action == "menu":
+        await state.clear()
+        await call.message.edit_text(
+            "⚙️ Админ-панель",
+            reply_markup=admin_menu(call.from_user.id)
+        )
+
+    elif action == "add":
+        await state.set_state(AdminStates.add_channel)
+        await call.message.edit_text(
+            "Отправьте @username канала, ссылку "
+            "t.me/... или ID (-100...), либо "
+            "перешлите сообщение из канала.\n\n"
+            "⚠️ Бот должен быть администратором канала.",
+            reply_markup=back_kb()
+        )
+
+    elif action == "list":
+        channels = list_channels()
+
+        text = "\n".join(
+            f"• {ch['title']} — {ch['link']}"
+            for ch in channels
+        ) or "Каналов пока нет."
+
+        await call.message.edit_text(
+            f"📋 Каналы:\n\n{text}",
+            reply_markup=back_kb(),
+            link_preview_options=NO_PREVIEW
+        )
+
+    elif action == "del":
+        channels = list_channels()
+
+        if not channels:
+            await call.message.edit_text(
+                "Каналов пока нет.",
+                reply_markup=back_kb()
+            )
+        else:
+            kb = InlineKeyboardBuilder()
+
+            for ch in channels:
+                kb.button(
+                    text=f"❌ {ch['title']}",
+                    callback_data=f"rm:{ch['chat_id']}"
+                )
+
+            kb.button(text="⬅️ В меню", callback_data="adm:menu")
+            kb.adjust(1)
+
+            await call.message.edit_text(
+                "Выберите канал для удаления:",
+                reply_markup=kb.as_markup()
+            )
+
+    elif action == "link":
+        await state.set_state(AdminStates.set_link)
+
+        current = get_setting("target_link") or "не задана"
+
+        await call.message.edit_text(
+            f"Текущая ссылка: {current}\n\n"
+            "Отправьте новую ссылку "
+            "(или «-», чтобы убрать).",
+            reply_markup=back_kb(),
+            link_preview_options=NO_PREVIEW
+        )
+
+    elif action == "text":
+        await state.set_state(AdminStates.set_text)
+        await call.message.edit_text(
+            "Отправьте новый текст, который "
+            "увидит пользователь после подписки.",
+            reply_markup=back_kb()
+        )
+
+    elif action == "stats":
+        await call.message.edit_text(
+            stats_text(),
+            reply_markup=back_kb()
+        )
+
+    elif action == "bc":
+        await state.set_state(AdminStates.broadcast)
+        await call.message.edit_text(
+            "📨 Рассылка\n\n"
+            "Отправьте сообщение для рассылки: текст, фото, "
+            "видео или файл с подписью. Оно уйдёт в том же "
+            "виде всем активным пользователям.\n\n"
+            "⚠️ Не удаляйте это сообщение из чата с ботом "
+            "до конца рассылки (особенно отложенной).",
+            reply_markup=back_kb()
+        )
+
+    elif action == "sched":
+        text, markup = scheduled_screen()
+        await call.message.edit_text(text, reply_markup=markup)
+
+    elif action == "src":
+        await state.set_state(AdminStates.source_name)
+        await call.message.edit_text(
+            "🏷 Источники\n\n"
+            "Отправьте название источника (латиница, цифры, "
+            "_ и -, до 32 символов), например: insta_oct\n\n"
+            "Я пришлю ссылку на бота с этой меткой. "
+            "Статистика по источникам есть в разделе "
+            "«Статистика».",
+            reply_markup=back_kb()
+        )
+
+    elif action == "join":
+        text, markup = join_screen()
+        await call.message.edit_text(
+            text,
+            reply_markup=markup,
+            link_preview_options=NO_PREVIEW
+        )
+
+    elif action == "joinset":
+        await state.set_state(AdminStates.join_channel)
+        await call.message.edit_text(
+            "Отправьте @username, ссылку t.me/..., ID (-100...) "
+            "закрытого канала или перешлите из него сообщение.\n\n"
+            "⚠️ Бот должен быть администратором канала с правом "
+            "приглашать пользователей и принимать заявки.\n"
+            "Этот канал не нужно добавлять в список "
+            "обязательных.",
+            reply_markup=back_kb()
+        )
+
+    elif action == "joinoff":
+        set_setting("join_chat_id", "")
+        set_setting("join_link", "")
+        text, markup = join_screen()
+        await call.message.edit_text(
+            "✅ Вход по заявке отключён.\n\n" + text,
+            reply_markup=markup,
+            link_preview_options=NO_PREVIEW
+        )
+
+    elif action == "nicks":
+        await call.message.edit_text(
+            nicks_text(),
+            reply_markup=back_kb()
+        )
+
+    elif action == "win_text":
+        await state.set_state(AdminStates.win_text)
+        await call.message.edit_text(
+            "Отправьте новый текст, который человек увидит "
+            "после выбора подарка. В конце лучше попросить "
+            "написать ник в Roblox (до 1000 символов).",
+            reply_markup=back_kb()
+        )
+
+    elif action == "sub_text":
+        await state.set_state(AdminStates.sub_text)
+        await call.message.edit_text(
+            "Отправьте новый текст, который человек увидит "
+            "после ввода ника, вместе с кнопками каналов.",
+            reply_markup=back_kb()
+        )
+
+    elif action == "welcome":
+        text, markup = welcome_screen()
+        await call.message.edit_text(text, reply_markup=markup)
+
+    elif action == "welcome_text":
+        await state.set_state(AdminStates.welcome_text)
+        await call.message.edit_text(
+            "Отправьте новый текст приветствия "
+            "(до 1024 символов).",
+            reply_markup=back_kb()
+        )
+
+    elif action == "welcome_photo":
+        await state.set_state(AdminStates.welcome_photo)
+        await call.message.edit_text(
+            "Отправьте картинку (как фото, не как файл).",
+            reply_markup=back_kb()
+        )
+
+    elif action == "welcome_photo_off":
+        set_setting("welcome_photo", "")
+        text, markup = welcome_screen()
+        await call.message.edit_text(
+            "✅ Картинка убрана.\n\n" + text,
+            reply_markup=markup
+        )
+
+    elif action == "welcome_preview":
+        await send_welcome(bot, call.message.chat.id)
+
+    elif action == "admins":
+        if not is_owner(call.from_user.id):
+            await call.answer("Только для владельца", show_alert=True)
+            return
+
+        text, markup = admins_screen()
+        await call.message.edit_text(text, reply_markup=markup)
+
+    elif action == "addadmin":
+        if not is_owner(call.from_user.id):
+            await call.answer("Только для владельца", show_alert=True)
+            return
+
+        await state.set_state(AdminStates.add_admin)
+        await call.message.edit_text(
+            "Отправьте числовой ID нового админа или "
+            "перешлите его сообщение.\n\n"
+            "ID можно узнать у бота @userinfobot.",
+            reply_markup=back_kb()
+        )
+
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("rm:"))
+async def admin_remove(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    chat_id = int(call.data.split(":", 1)[1])
+    remove_channel(chat_id)
+
+    await call.answer("Канал удалён")
+    await call.message.edit_text(
+        "✅ Канал удалён.",
+        reply_markup=admin_menu(call.from_user.id)
+    )
+
+
+@router.callback_query(F.data.startswith("rma:"))
+async def admin_remove_admin(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        await call.answer("Только для владельца", show_alert=True)
+        return
+
+    remove_admin(int(call.data.split(":", 1)[1]))
+
+    await call.answer("Админ удалён")
+    text, markup = admins_screen()
+    await call.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("sc:"))
+async def admin_cancel_scheduled(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    cancel_scheduled(int(call.data.split(":", 1)[1]))
+
+    await call.answer("Рассылка отменена")
+    text, markup = scheduled_screen()
+    await call.message.edit_text(text, reply_markup=markup)
+
+
+@router.message(AdminStates.add_channel)
+async def admin_add_channel(
+    message: Message,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    ref = parse_channel_ref(message)
+
+    if ref is None:
+        await message.answer(
+            "Не понял. Отправьте @username, ссылку, "
+            "ID или пересланное сообщение."
+        )
+        return
+
+    try:
+        chat = await bot.get_chat(ref)
+
+        me = await bot.get_chat_member(chat.id, bot.id)
+
+        if me.status not in ("administrator", "creator"):
+            await message.answer(
+                "⚠️ Сначала сделайте бота "
+                "администратором этого канала."
+            )
+            return
+
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        else:
+            link = (
+                await bot.create_chat_invite_link(chat.id)
+            ).invite_link
+
+    except Exception as error:
+        await message.answer(
+            f"❌ Ошибка: {error}\n"
+            "Проверьте, что бот добавлен в канал "
+            "как администратор."
+        )
+        return
+
+    add_channel(chat.id, chat.title or str(chat.id), link)
+
+    await state.clear()
+    await message.answer(
+        f"✅ Канал «{chat.title}» добавлен.",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+@router.message(AdminStates.set_link)
+async def admin_set_link(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    value = (message.text or "").strip()
+
+    set_setting("target_link", "" if value == "-" else value)
+
+    await state.clear()
+    await message.answer(
+        "✅ Ссылка сохранена.",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+@router.message(AdminStates.set_text)
+async def admin_set_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    set_setting("success_text", message.text or "")
+
+    await state.clear()
+    await message.answer(
+        "✅ Текст сохранён.",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+# ВВОД НИКА ROBLOX
+@router.message(UserStates.roblox_nick, F.text)
+async def user_roblox_nick(
+    message: Message,
+    bot: Bot,
+    state: FSMContext
+):
+    nick = message.text.strip()
+
+    if not nick:
+        await message.answer("Напишите ник текстом.")
+        return
+
+    if len(nick) > 100:
+        await message.answer(
+            "Слишком длинно, напишите только ник."
+        )
+        return
+
+    save_nick(
+        message.from_user.id, nick, message.from_user.username
+    )
+    await state.clear()
+
+    await message.answer(f"✅ Ник «{nick}» сохранён.")
+
+    channels = list_channels()
+    missing = (
+        await get_unsubscribed(bot, message.from_user.id)
+        if channels else []
+    )
+
+    if not missing:
+        await send_access(bot, message.chat.id)
+        return
+
+    await send_subscribe(bot, message.chat.id, channels)
+
+
+@router.message(UserStates.roblox_nick)
+async def user_roblox_nick_wrong(message: Message):
+    await message.answer("Отправьте ник текстом.")
+
+
+# ПРИВЕТСТВИЕ: ТЕКСТ И КАРТИНКА
+@router.message(AdminStates.win_text)
+async def admin_win_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    value = (message.text or "").strip()
+
+    if not value:
+        await message.answer("Отправьте текст сообщением.")
+        return
+
+    if len(value) > 1000:
+        await message.answer("Слишком длинно, сократите текст.")
+        return
+
+    set_setting("win_text", value)
+    await state.clear()
+
+    text, markup = welcome_screen()
+    await message.answer(
+        "✅ Текст сохранён.\n\n" + text,
+        reply_markup=markup
+    )
+
+
+@router.message(AdminStates.sub_text)
+async def admin_sub_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    value = (message.text or "").strip()
+
+    if not value:
+        await message.answer("Отправьте текст сообщением.")
+        return
+
+    if len(value) > 1500:
+        await message.answer("Слишком длинно, сократите текст.")
+        return
+
+    set_setting("subscribe_text", value)
+    await state.clear()
+
+    text, markup = welcome_screen()
+    await message.answer(
+        "✅ Текст сохранён.\n\n" + text,
+        reply_markup=markup
+    )
+
+@router.message(AdminStates.welcome_text)
+async def admin_welcome_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    value = (message.text or "").strip()
+
+    if not value:
+        await message.answer("Отправьте текст сообщением.")
+        return
+
+    if len(value) > 1024:
+        await message.answer(
+            f"Слишком длинно: {len(value)} из 1024 символов "
+            "(лимит подписи к картинке). Сократите текст."
+        )
+        return
+
+    set_setting("welcome_text", value)
+    await state.clear()
+
+    text, markup = welcome_screen()
+    await message.answer(
+        "✅ Текст сохранён.\n\n" + text,
+        reply_markup=markup
+    )
+
+
+@router.message(AdminStates.welcome_photo, F.photo)
+async def admin_welcome_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    set_setting("welcome_photo", message.photo[-1].file_id)
+    await state.clear()
+
+    text, markup = welcome_screen()
+    await message.answer(
+        "✅ Картинка сохранена.\n\n" + text,
+        reply_markup=markup
+    )
+
+
+@router.message(AdminStates.welcome_photo)
+async def admin_welcome_photo_wrong(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer(
+        "Нужна именно картинка. Отправьте её как фото "
+        "(не как файл)."
+    )
+
+
+# ВХОД ПО ЗАЯВКЕ: НАСТРОЙКА КАНАЛА
+@router.message(AdminStates.join_channel)
+async def admin_join_channel(
+    message: Message,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    ref = parse_channel_ref(message)
+
+    if ref is None:
+        await message.answer(
+            "Не понял. Отправьте @username, ссылку, "
+            "ID или пересланное сообщение."
+        )
+        return
+
+    try:
+        chat = await bot.get_chat(ref)
+
+        me = await bot.get_chat_member(chat.id, bot.id)
+
+        if me.status not in ("administrator", "creator"):
+            await message.answer(
+                "⚠️ Сначала сделайте бота "
+                "администратором этого канала."
+            )
+            return
+
+        invite = await bot.create_chat_invite_link(
+            chat.id,
+            name="Вход по заявке",
+            creates_join_request=True
+        )
+
+    except Exception as error:
+        await message.answer(
+            f"❌ Ошибка: {error}\n"
+            "Проверьте, что у бота есть права "
+            "приглашать пользователей."
+        )
+        return
+
+    set_setting("join_chat_id", str(chat.id))
+    set_setting("join_link", invite.invite_link)
+    # кнопка «Перейти» теперь ведёт на ссылку с заявкой
+    set_setting("target_link", invite.invite_link)
+
+    await state.clear()
+
+    text, markup = join_screen()
+    await message.answer(
+        "✅ Готово. Ссылка с заявкой также установлена как "
+        "«Ссылка после подписки».\n\n" + text,
+        reply_markup=markup,
+        link_preview_options=NO_PREVIEW
+    )
+
+
+# ИСТОЧНИКИ
+@router.message(AdminStates.source_name)
+async def admin_source_name(
+    message: Message,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    name = (message.text or "").strip()
+
+    if not SOURCE_RE.match(name):
+        await message.answer(
+            "Только латиница, цифры, _ и -, до 32 символов. "
+            "Попробуйте ещё раз."
+        )
+        return
+
+    me = await bot.get_me()
+    await state.clear()
+
+    await message.answer(
+        f"🏷 Источник «{name}»\n\n"
+        f"Ссылка: https://t.me/{me.username}?start={name}\n"
+        f"Пришло по ней: {source_count(name)}",
+        reply_markup=admin_menu(message.from_user.id),
+        link_preview_options=NO_PREVIEW
+    )
+
+
+# ДОБАВЛЕНИЕ АДМИНА
+@router.message(AdminStates.add_admin)
+async def admin_add_admin(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    new_id = None
+
+    origin = getattr(message, "forward_origin", None)
+    sender = getattr(origin, "sender_user", None)
+
+    if sender is not None:
+        new_id = sender.id
+    elif message.text and re.fullmatch(
+        r"\d+", message.text.strip()
+    ):
+        new_id = int(message.text.strip())
+
+    if new_id is None:
+        await message.answer(
+            "Не понял. Отправьте числовой ID или "
+            "перешлите сообщение пользователя "
+            "(если у него скрыт профиль, используйте ID)."
+        )
+        return
+
+    if is_admin(new_id):
+        await message.answer("Этот пользователь уже админ.")
+        return
+
+    add_admin(new_id)
+    await state.clear()
+
+    text, markup = admins_screen()
+    await message.answer(
+        f"✅ Админ {new_id} добавлен.\n\n{text}",
+        reply_markup=markup
+    )
+
+
+# РАССЫЛКА
+def make_markup(btn_text, btn_url):
+    if not btn_text or not btn_url:
+        return None
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=btn_text, url=btn_url)
+    return kb.as_markup()
+
+
+async def send_one(bot, user_id, from_chat_id, message_id, markup):
+    """Возвращает 'ok', 'blocked' или 'fail'."""
+    for _ in range(2):
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                reply_markup=markup
+            )
+            return "ok"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:
+            return "blocked"
+        except Exception:
+            logging.exception("Рассылка: ошибка для %s", user_id)
+            return "fail"
+    return "fail"
+
+
+async def run_broadcast(bot, from_chat_id, message_id, markup):
+    """Рассылает всем активным. Возвращает (sent, blocked, failed)."""
+    sent = blocked = failed = 0
+
+    async with broadcast_lock:
+        for uid in active_user_ids():
+            result = await send_one(
+                bot, uid, from_chat_id, message_id, markup
+            )
+
+            if result == "ok":
+                sent += 1
+            elif result == "blocked":
+                blocked += 1
+                set_user_active(uid, False)
+            else:
+                failed += 1
+
+            await asyncio.sleep(0.05)  # ~20 сообщений/сек
+
+    return sent, blocked, failed
+
+
+def report_text(title, sent, blocked, failed):
+    return (
+        f"{title}\n\n"
+        f"📬 Доставлено: {sent}\n"
+        f"🚫 Заблокировали бота: {blocked}\n"
+        f"⚠️ Ошибок: {failed}"
+    )
+
+
+@router.message(AdminStates.broadcast)
+async def admin_broadcast_message(
+    message: Message,
+    state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.update_data(
+        msg_id=message.message_id,
+        btn_text=None,
+        btn_url=None
+    )
+    await state.set_state(AdminStates.broadcast_button)
+
+    await message.answer(
+        "Добавить кнопку-ссылку под сообщением?\n\n"
+        "Отправьте в формате:\n"
+        "Текст кнопки | https://ссылка\n\n"
+        "Или «-», чтобы без кнопки.",
+        reply_markup=back_kb()
+    )
+
+
+@router.message(AdminStates.broadcast_button)
+async def admin_broadcast_button(
+    message: Message,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(message.from_user.id):
+        return
+
+    value = (message.text or "").strip()
+
+    if value != "-":
+        match = BUTTON_RE.match(value)
+
+        if not match:
+            await message.answer(
+                "Не понял формат. Пример:\n"
+                "Перейти на сайт | https://example.com\n"
+                "Или «-», чтобы без кнопки."
+            )
+            return
+
+        await state.update_data(
+            btn_text=match.group(1).strip(),
+            btn_url=match.group(2)
+        )
+
+    data = await state.get_data()
+    await state.set_state(None)  # данные остаются в FSM
+
+    try:
+        await bot.copy_message(
+            chat_id=message.chat.id,
+            from_chat_id=message.chat.id,
+            message_id=data["msg_id"],
+            reply_markup=make_markup(
+                data.get("btn_text"), data.get("btn_url")
+            )
+        )
+    except Exception as error:
+        await state.clear()
+        await message.answer(
+            f"❌ Не удалось сделать предпросмотр: {error}",
+            reply_markup=admin_menu(message.from_user.id)
+        )
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Отправить сейчас", callback_data="bc:now")
+    kb.button(text="⏰ Запланировать", callback_data="bc:sched")
+    kb.button(text="🧪 Тест мне", callback_data="bc:test")
+    kb.button(text="❌ Отмена", callback_data="bc:no")
+    kb.adjust(1, 1, 1, 1)
+
+    await message.answer(
+        f"Так увидят пользователи. Получателей: "
+        f"{len(active_user_ids())}. Что делаем?",
+        reply_markup=kb.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("bc:"))
+async def broadcast_actions(
+    call: CallbackQuery,
+    bot: Bot,
+    state: FSMContext
+):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    action = call.data.split(":", 1)[1]
+
+    if action == "no":
+        await state.clear()
+        await call.answer("Отменено")
+        await call.message.edit_text(
+            "❌ Рассылка отменена.",
+            reply_markup=admin_menu(call.from_user.id)
+        )
+        return
+
+    data = await state.get_data()
+    msg_id = data.get("msg_id")
+
+    if not msg_id:
+        await call.answer(
+            "Сессия устарела. Начните рассылку заново.",
+            show_alert=True
+        )
+        return
+
+    chat_id = call.message.chat.id
+    markup = make_markup(data.get("btn_text"), data.get("btn_url"))
+
+    if action == "test":
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=markup
+            )
+            await call.answer("Тест отправлен вам ✅")
+        except Exception as error:
+            await call.answer(f"Ошибка: {error}", show_alert=True)
+        return
+
+    if action == "sched":
+        await state.set_state(AdminStates.schedule_time)
+        await call.answer()
+        await call.message.edit_text(
+            f"⏰ Когда отправить? Часовой пояс: {TIMEZONE}\n\n"
+            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            "Например: 20.10.2026 18:30",
+            reply_markup=back_kb()
+        )
+        return
+
+    if action == "now":
+        if broadcast_lock.locked():
+            await call.answer(
+                "Другая рассылка ещё идёт, подождите.",
+                show_alert=True
+            )
+            return
+
+        await state.clear()
+        await call.answer()
+        await call.message.edit_text(
+            "⏳ Рассылка запущена..."
+        )
+
+        sent, blocked, failed = await run_broadcast(
+            bot, chat_id, msg_id, markup
+        )
+
+        await call.message.edit_text(
+            report_text("✅ Рассылка завершена", sent, blocked, failed),
+            reply_markup=admin_menu(call.from_user.id)
+        )
+        return
+
+    await call.answer()
+
+
+@router.message(AdminStates.schedule_time)
+async def admin_schedule_time(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    try:
+        run_at = parse_local_time(message.text or "")
+    except ValueError:
+        await message.answer(
+            "Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ, "
+            "например 20.10.2026 18:30"
+        )
+        return
+
+    if run_at <= datetime.now(timezone.utc):
+        await message.answer(
+            "Это время уже прошло. Укажите время в будущем."
+        )
+        return
+
+    data = await state.get_data()
+
+    if not data.get("msg_id"):
+        await state.clear()
+        await message.answer(
+            "Сессия устарела. Начните рассылку заново.",
+            reply_markup=admin_menu(message.from_user.id)
+        )
+        return
+
+    sched_id = add_scheduled(
+        run_at,
+        message.from_user.id,
+        message.chat.id,
+        data["msg_id"],
+        data.get("btn_text"),
+        data.get("btn_url")
+    )
+
+    await state.clear()
+    await message.answer(
+        f"✅ Рассылка #{sched_id} запланирована на "
+        f"{utc_str_to_local(run_at.strftime('%Y-%m-%d %H:%M:%S'))} "
+        f"({TIMEZONE}).\n\n"
+        "Не удаляйте исходное сообщение из чата с ботом.",
+        reply_markup=admin_menu(message.from_user.id)
+    )
+
+
+async def scheduler(bot: Bot):
+    """Фоновая задача: раз в 20 секунд запускает наступившие рассылки."""
+    while True:
+        try:
+            for row in claim_due():
+                sent, blocked, failed = await run_broadcast(
+                    bot,
+                    row["from_chat_id"],
+                    row["message_id"],
+                    make_markup(row["btn_text"], row["btn_url"])
+                )
+                finish_scheduled(row["id"])
+
+                try:
+                    await bot.send_message(
+                        row["admin_id"],
+                        report_text(
+                            f"⏰ Отложенная рассылка #{row['id']} "
+                            "завершена",
+                            sent, blocked, failed
+                        )
+                    )
+                except Exception:
+                    logging.exception("Не удалось отправить отчёт")
+        except Exception:
+            logging.exception("Ошибка планировщика")
+
+        await asyncio.sleep(20)
+
+
+# ЗАПУСК БОТА
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "Задайте токен: export BOT_TOKEN='ваш_токен'"
+        )
+
+    logging.basicConfig(level=logging.INFO)
+
+    init_db()
+
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.include_router(router)
+
+    scheduler_task = asyncio.create_task(scheduler(bot))
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler_task.cancel()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
